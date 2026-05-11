@@ -38,7 +38,7 @@ func getVersion() string {
 	return v
 }
 
-func generateRPC() {
+func generateRPC() string {
 	version := getVersion()
 
 	first := run("help")
@@ -130,6 +130,7 @@ func generateRPC() {
 			log.Fatalf("Cannot make index file: %s", err.Error())
 		}
 	}
+	return version
 }
 
 func run(args ...string) string {
