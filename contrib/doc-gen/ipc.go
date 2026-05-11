@@ -16,6 +16,18 @@ import (
 // Schema files to document, in the order they should appear.
 var schemaFiles = []string{"init", "echo", "mining", "common"}
 
+// Header files providing doxygen-style comments per interface, by Cap'n
+// Proto interface name (the schema's `interface Foo` becomes a C++
+// `class Foo`). Set the value to "" to opt an interface out of doxygen
+// extraction. Adding a new interface to the schemas without a matching
+// entry here is treated as an error.
+var interfaceHeaders = map[string]string{
+	"Init":          "interfaces/init.h",
+	"Echo":          "interfaces/echo.h",
+	"Mining":        "interfaces/mining.h",
+	"BlockTemplate": "interfaces/mining.h",
+}
+
 // Cap'n Proto built-in types we render with the keyword-type style.
 var builtinTypes = map[string]bool{
 	"Void": true, "Bool": true,
@@ -37,6 +49,7 @@ var (
 type Method struct {
 	Name string
 	Body string
+	Doc  string // doxygen description extracted from header (HTML)
 	// MakesIface is non-empty when the method is an Init "factory" returning an
 	// interface (e.g. `makeMining` returning `Mining.Mining`). The value is the
 	// lowercase interface group name we link to.
@@ -85,6 +98,15 @@ func generateIPC(bitcoin, version string) {
 		ifaceSet[i.Name] = true
 	}
 
+	// Refuse to silently skip a newly-added interface: every interface in
+	// the schemas must be mapped to a header file (or to "" to opt out).
+	for _, i := range ifaces {
+		if _, known := interfaceHeaders[i.Name]; !known {
+			log.Fatalf("Unknown interface %q has no entry in interfaceHeaders. "+
+				"Add it to contrib/doc-gen/ipc.go (use \"\" to skip doxygen for it).", i.Name)
+		}
+	}
+
 	// Filter hidden/deprecated methods, and detect `make<Iface>` factories
 	// whose return type names a known interface — those get linked.
 	for ii := range ifaces {
@@ -102,6 +124,20 @@ func generateIPC(bitcoin, version string) {
 			keep = append(keep, m)
 		}
 		ifaces[ii].Methods = keep
+	}
+
+	// Attach doxygen documentation harvested from the C++ headers.
+	for ii := range ifaces {
+		hdr := interfaceHeaders[ifaces[ii].Name]
+		if hdr == "" {
+			continue
+		}
+		comments := extractDoxygen(filepath.Join(srcDir, hdr), ifaces[ii].Name)
+		for mi := range ifaces[ii].Methods {
+			if doc, ok := comments[ifaces[ii].Methods[mi].Name]; ok {
+				ifaces[ii].Methods[mi].Doc = linkifyDoc(doc, ifaceSet, structSet, "../../")
+			}
+		}
 	}
 
 	docRoot := filepath.Join("..", "..", "_doc", "en", version, "ipc")
@@ -322,6 +358,310 @@ func returnedTypeName(body string) string {
 }
 
 // -----------------------------------------------------------------------------
+// Doxygen extraction from C++ headers
+// -----------------------------------------------------------------------------
+
+var (
+	reClassStart  = regexp.MustCompile(`^\s*class\s+(\w+)\b`)
+	reMethodDecl  = regexp.MustCompile(`^\s*virtual\b.*?\b(\w+)\s*\(`)
+	reSlashSlash3 = regexp.MustCompile(`^\s*///\s?`)
+	reSlashBang   = regexp.MustCompile(`^\s*//!\s?`)
+	reBlockStart  = regexp.MustCompile(`^\s*/\*\*+\s?`)
+	reBlockMid    = regexp.MustCompile(`^\s*\*\s?`)
+	reBlockEnd    = regexp.MustCompile(`\*+/\s*$`)
+)
+
+// extractDoxygen returns a map of methodName -> rendered HTML description for
+// methods declared inside `class <className>` of the given header file.
+func extractDoxygen(path, className string) map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("warn: cannot read %s: %s", path, err)
+		return nil
+	}
+	lines := strings.Split(string(data), "\n")
+
+	classStart := -1
+	for i, line := range lines {
+		m := reClassStart.FindStringSubmatch(line)
+		if m != nil && m[1] == className {
+			classStart = i
+			break
+		}
+	}
+	if classStart < 0 {
+		return nil
+	}
+	classEnd := len(lines)
+	depth := 0
+	started := false
+	for i := classStart; i < len(lines); i++ {
+		line := stripStringsAndComments(lines[i])
+		for _, r := range line {
+			if r == '{' {
+				depth++
+				started = true
+			} else if r == '}' {
+				depth--
+				if started && depth == 0 {
+					classEnd = i
+					break
+				}
+			}
+		}
+		if started && depth == 0 {
+			break
+		}
+	}
+
+	out := map[string]string{}
+	var pendingComment []string
+	flush := func() { pendingComment = nil }
+
+	for i := classStart + 1; i < classEnd; i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			flush()
+			continue
+		}
+		if reBlockStart.MatchString(line) {
+			pendingComment = nil
+			if reBlockEnd.MatchString(line) {
+				inner := line
+				inner = reBlockStart.ReplaceAllString(inner, "")
+				inner = reBlockEnd.ReplaceAllString(inner, "")
+				pendingComment = append(pendingComment, strings.TrimSpace(inner))
+				continue
+			}
+			inner := reBlockStart.ReplaceAllString(line, "")
+			pendingComment = append(pendingComment, strings.TrimSpace(inner))
+			for j := i + 1; j < classEnd; j++ {
+				i = j
+				ln := lines[j]
+				if reBlockEnd.MatchString(ln) {
+					ln = reBlockEnd.ReplaceAllString(ln, "")
+					ln = reBlockMid.ReplaceAllString(ln, "")
+					pendingComment = append(pendingComment, strings.TrimRight(ln, " \t"))
+					break
+				}
+				ln = reBlockMid.ReplaceAllString(ln, "")
+				pendingComment = append(pendingComment, strings.TrimRight(ln, " \t"))
+			}
+			continue
+		}
+		if reSlashBang.MatchString(line) {
+			pendingComment = append(pendingComment, reSlashBang.ReplaceAllString(line, ""))
+			continue
+		}
+		if reSlashSlash3.MatchString(line) {
+			pendingComment = append(pendingComment, reSlashSlash3.ReplaceAllString(line, ""))
+			continue
+		}
+		if m := reMethodDecl.FindStringSubmatch(line); m != nil {
+			name := m[1]
+			if len(pendingComment) > 0 {
+				out[name] = renderDoxygen(pendingComment)
+			}
+			flush()
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "//") {
+			flush()
+		}
+	}
+	return out
+}
+
+func stripStringsAndComments(line string) string {
+	if i := strings.Index(line, "//"); i >= 0 {
+		line = line[:i]
+	}
+	for {
+		s := strings.Index(line, "/*")
+		if s < 0 {
+			break
+		}
+		e := strings.Index(line[s:], "*/")
+		if e < 0 {
+			line = line[:s]
+			break
+		}
+		line = line[:s] + line[s+e+2:]
+	}
+	return line
+}
+
+func renderDoxygen(lines []string) string {
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+
+	type tagged struct {
+		Kind string // "prose", "param", "retval", "returns"
+		Key  string
+		Dir  string // "in", "out", "in,out" for @param
+		Text []string
+	}
+	var sections []tagged
+	cur := tagged{Kind: "prose"}
+	push := func() {
+		if len(cur.Text) > 0 || cur.Key != "" {
+			sections = append(sections, cur)
+		}
+		cur = tagged{Kind: "prose"}
+	}
+
+	tagRe := regexp.MustCompile(`^\s*@(param(?:\[[^\]]+\])?|retval|returns?)(?:\s+|$)(\S*)\s*(.*)$`)
+	for _, ln := range lines {
+		if m := tagRe.FindStringSubmatch(ln); m != nil {
+			push()
+			tag := m[1]
+			key := m[2]
+			text := strings.TrimSpace(m[3])
+			switch {
+			case strings.HasPrefix(tag, "param"):
+				dir := ""
+				if strings.HasPrefix(tag, "param[") {
+					dir = strings.TrimSuffix(strings.TrimPrefix(tag, "param["), "]")
+				}
+				cur = tagged{Kind: "param", Key: key, Dir: dir, Text: []string{text}}
+			case tag == "retval":
+				cur = tagged{Kind: "retval", Key: key, Text: []string{text}}
+			default:
+				cur = tagged{Kind: "returns", Key: key, Text: []string{text}}
+			}
+			continue
+		}
+		cur.Text = append(cur.Text, strings.TrimSpace(ln))
+	}
+	push()
+
+	var b strings.Builder
+	var inDL bool
+	closeDL := func() {
+		if inDL {
+			b.WriteString("</dl>\n")
+			inDL = false
+		}
+	}
+	openDL := func() {
+		if !inDL {
+			b.WriteString(`<dl class="ipc-doc-tags">` + "\n")
+			inDL = true
+		}
+	}
+	for _, sec := range sections {
+		text := strings.TrimSpace(strings.Join(sec.Text, " "))
+		switch sec.Kind {
+		case "prose":
+			closeDL()
+			for _, p := range splitParas(sec.Text) {
+				if p == "" {
+					continue
+				}
+				fmt.Fprintf(&b, "<p>%s</p>\n", html.EscapeString(p))
+			}
+		case "param":
+			openDL()
+			label := "param"
+			if sec.Dir != "" {
+				label = fmt.Sprintf("param [%s]", sec.Dir)
+			}
+			fmt.Fprintf(&b, `  <dt><strong>%s</strong> <code>%s</code></dt>`+"\n",
+				html.EscapeString(label), html.EscapeString(sec.Key))
+			fmt.Fprintf(&b, "  <dd>%s</dd>\n", html.EscapeString(text))
+		case "retval":
+			openDL()
+			fmt.Fprintf(&b, `  <dt><strong>returns</strong> <code>%s</code></dt>`+"\n",
+				html.EscapeString(sec.Key))
+			fmt.Fprintf(&b, "  <dd>%s</dd>\n", html.EscapeString(text))
+		case "returns":
+			openDL()
+			b.WriteString("  <dt><strong>returns</strong></dt>\n")
+			full := strings.TrimSpace(sec.Key + " " + text)
+			fmt.Fprintf(&b, "  <dd>%s</dd>\n", html.EscapeString(full))
+		}
+	}
+	closeDL()
+	return b.String()
+}
+
+func splitParas(lines []string) []string {
+	var paras []string
+	var cur []string
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			if len(cur) > 0 {
+				paras = append(paras, strings.Join(cur, " "))
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, ln)
+	}
+	if len(cur) > 0 {
+		paras = append(paras, strings.Join(cur, " "))
+	}
+	return paras
+}
+
+// linkifyDoc rewrites already-rendered doxygen HTML so that whole-word
+// occurrences of known interface or struct names become links to their
+// documentation pages. Linking happens inside text nodes only — existing
+// tags and href attributes are left untouched.
+func linkifyDoc(htmlIn string, ifaceSet, structSet map[string]bool, ifaceHrefBase string) string {
+	if len(ifaceSet) == 0 && len(structSet) == 0 {
+		return htmlIn
+	}
+	var b strings.Builder
+	i := 0
+	for i < len(htmlIn) {
+		if htmlIn[i] == '<' {
+			end := strings.IndexByte(htmlIn[i:], '>')
+			if end < 0 {
+				b.WriteString(htmlIn[i:])
+				break
+			}
+			b.WriteString(htmlIn[i : i+end+1])
+			i += end + 1
+			continue
+		}
+		nextTag := strings.IndexByte(htmlIn[i:], '<')
+		var seg string
+		if nextTag < 0 {
+			seg = htmlIn[i:]
+			i = len(htmlIn)
+		} else {
+			seg = htmlIn[i : i+nextTag]
+			i += nextTag
+		}
+		b.WriteString(linkifySegment(seg, ifaceSet, structSet, ifaceHrefBase))
+	}
+	return b.String()
+}
+
+var reIdentToken = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+func linkifySegment(seg string, ifaceSet, structSet map[string]bool, ifaceHrefBase string) string {
+	return reIdentToken.ReplaceAllStringFunc(seg, func(tok string) string {
+		switch {
+		case ifaceSet[tok]:
+			return fmt.Sprintf(`<a href="%s%s/">%s</a>`,
+				ifaceHrefBase, strings.ToLower(tok), tok)
+		case structSet[tok]:
+			return fmt.Sprintf(`<a href="%sstructs/#%s">%s</a>`,
+				ifaceHrefBase, tok, tok)
+		}
+		return tok
+	})
+}
+
+// -----------------------------------------------------------------------------
 // Cleanup of canonical capnp output
 // -----------------------------------------------------------------------------
 
@@ -443,6 +783,11 @@ func renderMethodPage(iface Interface, m Method, structSet, ifaceSet map[string]
 	b.WriteString(`<div class="highlight"><pre><code>`)
 	b.WriteString(highlighted)
 	b.WriteString(`</code></pre></div>` + "\n")
+	if m.Doc != "" {
+		b.WriteString(`<div class="ipc-doc">` + "\n")
+		b.WriteString(m.Doc)
+		b.WriteString("</div>\n")
+	}
 	if m.MakesIface != "" {
 		fmt.Fprintf(&b, `<p class="ipc-makes">Returns the <a href="../../%s/">%s</a> interface.</p>`+"\n",
 			html.EscapeString(m.MakesIface), html.EscapeString(strings.Title(m.MakesIface)))
